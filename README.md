@@ -2,6 +2,8 @@
 
 A compact [Home Assistant](https://www.home-assistant.io/) Lovelace card for a single **Proxmox VE guest** (VM or LXC), built for the [proxmoxve](https://www.home-assistant.io/integrations/proxmoxve/) integration.
 
+![Proxmox Guest Card example](screenshots/card-example.png)
+
 Shows status, which node it's running on, uptime, and CPU / RAM / Disk usage — with raw GB values, not just percentages — plus working **Start / Stop / Reboot** buttons.
 
 ## Why
