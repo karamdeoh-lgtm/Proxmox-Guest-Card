@@ -10,11 +10,22 @@
  * License: MIT
  */
 class ProxmoxGuestCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+  }
   setConfig(config) {
     if (!config.entity) {
       throw new Error('You need to define an entity (the guest status sensor, e.g. binary_sensor.lxc_plex_101_status)');
     }
-    this.config = config;
+    if (!/^binary_sensor\.[a-z0-9_]+_status$/.test(config.entity)) {
+      throw new Error('entity must be a binary_sensor guest status entity ending in _status');
+    }
+    if (config.metrics_source && !['proxmox', 'beszel'].includes(config.metrics_source)) {
+      throw new Error('metrics_source must be proxmox or beszel');
+    }
+    this.config = { ...config };
+    if (this._hass) this.hass = this._hass;
   }
 
   _deriveEntity(suffix) {
@@ -25,6 +36,38 @@ class ProxmoxGuestCard extends HTMLElement {
   _deriveButton(suffix) {
     const base = this.config.entity.replace('binary_sensor.', 'button.').replace(/_status$/, '');
     return base + suffix;
+  }
+
+  _number(state) {
+    if (!state || typeof state.state !== 'string' || !state.state.trim()) return null;
+    const value = Number(state.state);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  }
+
+  _sizeGB(state) {
+    const value = this._number(state);
+    const factors = { B: 1e-9, kB: 1e-6, KB: 1e-6, MB: 1e-3, GB: 1,
+      TB: 1e3, KiB: 1024 / 1e9, MiB: 1024 ** 2 / 1e9,
+      GiB: 1024 ** 3 / 1e9, TiB: 1024 ** 4 / 1e9 };
+    const factor = factors[state?.attributes?.unit_of_measurement];
+    return value !== null && factor !== undefined ? value * factor : null;
+  }
+
+  _metric(kind, suffixes) {
+    const states = this._hass.states;
+    const beszel = this.config.metrics_source === 'beszel';
+    const mapping = beszel ? (this.config.beszel || {}) : this.config;
+    const percentId = mapping[`${kind}_entity`] || (!beszel ? this._deriveEntity(suffixes[0]) : null);
+    // Never combine an overridden percentage with unrelated auto-derived totals.
+    const deriveRaw = !beszel && !mapping[`${kind}_entity`];
+    const usedId = mapping[`${kind}_used_entity`] || (deriveRaw ? this._deriveEntity(suffixes[1]) : null);
+    const totalId = mapping[`${kind}_total_entity`] || (deriveRaw ? this._deriveEntity(suffixes[2]) : null);
+    let percent = this._number(states[percentId]);
+    if (states[percentId]?.attributes?.unit_of_measurement !== '%') percent = null;
+    const used = this._sizeGB(states[usedId]);
+    const total = this._sizeGB(states[totalId]);
+    if (percent === null && used !== null && total > 0 && used <= total) percent = used / total * 100;
+    return { percent, used: total > 0 && used !== null && used <= total ? used : null, total };
   }
 
   _fmtGB(value) {
@@ -54,7 +97,7 @@ class ProxmoxGuestCard extends HTMLElement {
   _relativeTime(isoString) {
     if (!isoString) return null;
     const then = new Date(isoString).getTime();
-    if (isNaN(then)) return null;
+    if (!Number.isFinite(then) || then > Date.now()) return null;
     const diffSec = Math.floor((Date.now() - then) / 1000);
     if (diffSec < 60) return 'just now';
     const mins = Math.floor(diffSec / 60);
@@ -73,17 +116,36 @@ class ProxmoxGuestCard extends HTMLElement {
     return `hsl(${hue}, 55%, 55%)`;
   }
 
-  _callButton(entityId) {
-    if (!this._hass || !entityId) return;
-    this._hass.callService('button', 'press', { entity_id: entityId });
+  async _callButton(entityId, action) {
+    const state = this._hass?.states[this.config.entity]?.state;
+    const target = this._hass?.states[entityId];
+    if (this._busy || !['on', 'off'].includes(state) || !target ||
+        ['unavailable', 'unknown'].includes(target.state)) return;
+    if ((action === 'start') !== (state === 'off')) return;
+    if (action !== 'start' && this.config.confirm_actions !== false &&
+        !window.confirm(`${action === 'stop' ? 'Stop' : 'Reboot'} ${this.config.name || this.config.entity}?`)) return;
+    this._busy = true;
+    this._actionError = '';
+    this.hass = this._hass;
+    try {
+      await this._hass.callService('button', 'press', { entity_id: entityId });
+    } catch (error) {
+      this._actionError = `Action failed: ${error?.message || 'Home Assistant rejected the request'}`;
+    } finally {
+      this._busy = false;
+      this.hass = this._hass;
+    }
   }
 
   set hass(hass) {
     this._hass = hass;
+    if (!this.config) return;
     if (!this.content) {
-      this.innerHTML = `
+      this.shadowRoot.innerHTML = `
         <ha-card>
           <style>
+            .action-btn:disabled { opacity: .45; cursor: not-allowed; }
+            .action-error { color: var(--error-color, #f87171); font-size: .8rem; }
             ha-card { padding: 16px; display: flex; flex-direction: column; gap: 12px; border-left: 3px solid var(--divider-color, #333); transition: border-color 0.3s ease; }
             .header { display: flex; align-items: center; gap: 8px; }
             .status-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; box-shadow: 0 0 6px currentColor; }
@@ -118,11 +180,12 @@ class ProxmoxGuestCard extends HTMLElement {
             </div>
             <div class="gauges"></div>
             <div class="actions"></div>
+            <div class="action-error" role="alert"></div>
           </div>
         </ha-card>
       `;
-      this.content = this.querySelector('.card-content');
-      this.card = this.querySelector('ha-card');
+      this.content = this.shadowRoot.querySelector('.card-content');
+      this.card = this.shadowRoot.querySelector('ha-card');
       this.content.addEventListener('click', (e) => {
         if (e.target.closest('.actions')) return;
         const event = new Event('hass-more-info', { bubbles: true, composed: true });
@@ -152,65 +215,73 @@ class ProxmoxGuestCard extends HTMLElement {
     const nodeState = hass.states[nodeEntity];
     const bootState = hass.states[bootEntity];
 
-    const isRunning = statusState && statusState.state === 'on';
+    const statusKnown = ['on', 'off'].includes(statusState?.state);
+    const isRunning = statusState?.state === 'on';
     const defaultName = statusState && statusState.attributes.friendly_name
       ? statusState.attributes.friendly_name.replace(' Status', '')
       : this.config.entity;
     const name = this.config.name || defaultName;
     const isLxc = this.config.entity.includes('lxc_');
 
-    const dot = this.querySelector('.status-dot');
-    dot.style.background = isRunning ? '#4ade80' : '#f87171';
-    dot.style.color = isRunning ? '#4ade80' : '#f87171';
-    this.querySelector('.name').textContent = name;
-    this.querySelector('.type-badge').textContent = isLxc ? 'LXC' : 'VM';
+    const dot = this.shadowRoot.querySelector('.status-dot');
+    dot.style.background = !statusKnown ? '#9ca3af' : isRunning ? '#4ade80' : '#f87171';
+    dot.style.color = !statusKnown ? '#9ca3af' : isRunning ? '#4ade80' : '#f87171';
+    this.shadowRoot.querySelector('.name').textContent = name;
+    this.shadowRoot.querySelector('.type-badge').textContent = isLxc ? 'LXC' : 'VM';
 
-    const cpuVal = cpuState ? parseFloat(cpuState.state) : null;
-    const ramVal = ramState ? parseFloat(ramState.state) : null;
-    const diskVal = diskState ? parseFloat(diskState.state) : null;
-    const ramUsedVal = ramUsedState ? parseFloat(ramUsedState.state) : null;
-    const ramTotalVal = ramTotalState ? parseFloat(ramTotalState.state) : null;
-    const diskUsedVal = diskUsedState ? parseFloat(diskUsedState.state) : null;
-    const diskTotalVal = diskTotalState ? parseFloat(diskTotalState.state) : null;
+    const ram = this._metric('ram', ['_memory_used_percentage', '_memory_used', '_memory_total']);
+    const disk = this._metric('disk', ['_disk_used_percentage', '_disk_used', '_disk_total']);
+    const cpuId = this.config.metrics_source === 'beszel' ? this.config.beszel?.cpu_entity : cpuEntity;
+    const cpu = hass.states[cpuId];
+    const cpuVal = cpu?.attributes?.unit_of_measurement === '%' ? this._number(cpu) : null;
+    const ramVal = ram.percent, diskVal = disk.percent;
+    const ramUsedVal = ram.used, ramTotalVal = ram.total;
+    const diskUsedVal = disk.used, diskTotalVal = disk.total;
 
     const maxVal = Math.max(cpuVal || 0, ramVal || 0, diskVal || 0);
-    this.card.style.borderLeftColor = !isRunning ? '#f87171' : maxVal > 90 ? '#f87171' : maxVal > 70 ? '#fbbf24' : '#4ade80';
+    this.card.style.borderLeftColor = !statusKnown ? '#9ca3af' : !isRunning ? '#f87171' : maxVal > 90 ? '#f87171' : maxVal > 70 ? '#fbbf24' : '#4ade80';
 
     const nodeName = nodeState && nodeState.state && nodeState.state !== 'unavailable' && nodeState.state !== 'unknown' ? nodeState.state : null;
-    const nodeBadgeWrap = this.querySelector('.node-badge-wrap');
+    const nodeBadgeWrap = this.shadowRoot.querySelector('.node-badge-wrap');
     nodeBadgeWrap.innerHTML = nodeName
-      ? `<span class="node-badge" style="background:${this._nodeColor(nodeName)}">${nodeName}</span>`
+      ? `<span class="node-badge" style="background:${this._nodeColor(nodeName)}"></span>`
       : '';
 
-    const uptimeRel = bootState ? this._relativeTime(bootState.state) : null;
-    const uptimeText = isRunning && uptimeRel ? `\u23F1\uFE0F up ${uptimeRel}` : (!isRunning ? 'stopped' : '');
-    this.querySelector('.uptime-info').textContent = uptimeText;
+    if (nodeName) nodeBadgeWrap.querySelector('.node-badge').textContent = nodeName;
 
-    this.querySelector('.gauges').innerHTML =
+    const uptimeRel = bootState ? this._relativeTime(bootState.state) : null;
+    const uptimeText = !statusKnown ? 'Status unavailable' : isRunning && uptimeRel ? `\u23F1\uFE0F up ${uptimeRel}` : (!isRunning ? 'stopped' : '');
+    this.shadowRoot.querySelector('.uptime-info').textContent = `${uptimeText} · ${this.config.metrics_source === 'beszel' ? 'Beszel' : 'Proxmox'}`;
+
+    this.shadowRoot.querySelector('.gauges').innerHTML =
       this._gauge('CPU', cpuVal, '#60a5fa') +
       this._gauge('RAM', ramVal, '#a78bfa', ramUsedVal, ramTotalVal) +
       (this.config.show_disk !== false ? this._gauge('Disk', diskVal, '#34d399', diskUsedVal, diskTotalVal) : '');
 
-    if (this.config.show_actions !== false) {
+    this.shadowRoot.querySelector('.action-error').textContent = this._actionError || '';
+    if (this.config.show_actions !== false && statusKnown) {
       const startBtn = this._deriveButton('_start');
       const stopBtn = this._deriveButton('_stop');
       const rebootBtn = this._deriveButton('_reboot');
-      const actionsEl = this.querySelector('.actions');
+      const actionsEl = this.shadowRoot.querySelector('.actions');
       actionsEl.innerHTML = isRunning
-        ? `<div class="action-btn" data-action="reboot"><ha-icon icon="mdi:restart"></ha-icon>Reboot</div>
-           <div class="action-btn danger" data-action="stop"><ha-icon icon="mdi:stop"></ha-icon>Stop</div>`
-        : `<div class="action-btn" data-action="start"><ha-icon icon="mdi:play"></ha-icon>Start</div>`;
+        ? `<button type="button" class="action-btn" data-action="reboot"><ha-icon icon="mdi:restart"></ha-icon>Reboot</button>
+           <button type="button" class="action-btn danger" data-action="stop"><ha-icon icon="mdi:stop"></ha-icon>Stop</button>`
+        : `<button type="button" class="action-btn" data-action="start"><ha-icon icon="mdi:play"></ha-icon>Start</button>`;
       actionsEl.querySelectorAll('.action-btn').forEach((btn) => {
+        const targetId = { start: startBtn, stop: stopBtn, reboot: rebootBtn }[btn.dataset.action];
+        const targetState = hass.states[targetId];
+        btn.disabled = !!this._busy || !targetState || ['unknown', 'unavailable'].includes(targetState.state);
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
           const action = btn.dataset.action;
-          if (action === 'start') this._callButton(startBtn);
-          if (action === 'stop') this._callButton(stopBtn);
-          if (action === 'reboot') this._callButton(rebootBtn);
+          if (action === 'start') this._callButton(startBtn, 'start');
+          if (action === 'stop') this._callButton(stopBtn, 'stop');
+          if (action === 'reboot') this._callButton(rebootBtn, 'reboot');
         });
       });
     } else {
-      this.querySelector('.actions').innerHTML = '';
+      this.shadowRoot.querySelector('.actions').innerHTML = '';
     }
   }
 
